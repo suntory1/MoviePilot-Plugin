@@ -898,7 +898,7 @@ class CustomIYUUAutoSeed(_PluginBase):
         downloader_obj = self.__get_downloader(downloader)
         torrent_info, _ = downloader_obj.get_torrents(ids=[seed.get("info_hash")])
         if torrent_info:
-            logger.info(f"{seed.get('info_hash')} 已在下载器中，跳过 ...")
+            # logger.info(f"{seed.get('info_hash')} 已在下载器中，跳过 ...")
             self.exist += 1
             return False
         # 站点流控
