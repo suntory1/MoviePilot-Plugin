@@ -34,7 +34,7 @@ class CustomIYUUAutoSeed(_PluginBase):
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "1.9.4"
+    plugin_version = "1.9.5"
     # 插件作者
     plugin_author = "jxxghp"
     # 作者主页
@@ -581,10 +581,10 @@ class CustomIYUUAutoSeed(_PluginBase):
                     return
                 # 获取种子hash
                 hash_str = self.__get_hash(torrent, downloader)
-                if hash_str in self._error_caches or hash_str in self._permanent_error_caches:
-                    logger.info(f"种子 {hash_str} 辅种失败且已缓存，跳过 ...")
-                    continue
                 save_path = self.__get_save_path(torrent, downloader)
+                if hash_str in self._error_caches or hash_str in self._permanent_error_caches:
+                    logger.info(f"种子 {hash_str} - {save_path} 辅种失败且已缓存1，跳过 ...")
+                    continue
 
                 if self._nopaths and save_path:
                     # 过滤不需要转移的路径
@@ -740,7 +740,7 @@ class CustomIYUUAutoSeed(_PluginBase):
                     # logger.info(f"{seed.get('info_hash')} 已处理过辅种，跳过 ...")
                     continue
                 if seed.get("info_hash") in self._error_caches or seed.get("info_hash") in self._permanent_error_caches:
-                    logger.info(f"种子 {seed.get('info_hash')} 辅种失败且已缓存，跳过 ...")
+                    logger.info(f"种子 {seed.get('info_hash')} 辅种失败且已缓存2，跳过 ...")
                     continue
                 # 添加任务
                 success = self.__download_torrent(seed=seed,

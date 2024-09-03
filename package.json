@@ -3,11 +3,12 @@
         "name": "自定义IYUU自动辅种",
         "description": "基于IYUU官方Api实现自动辅种。",
         "labels": "做种,IYUU",
-        "version": "1.9.4",
+        "version": "1.9.5",
         "icon": "IYUU.png",
         "author": "jxxghp",
         "level": 2,
         "history": {
+            "v1.9.5": "添加下载路径信息",
             "v1.9.4": "去除多余日志",
             "v1.9.3": "修复Monika因缺少rsskey，种子下载失败的问题",
             "v1.9.2": "适配馒头使用API下载种子",
