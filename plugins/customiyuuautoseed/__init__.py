@@ -34,7 +34,7 @@ class CustomIYUUAutoSeed(_PluginBase):
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "1.9.5"
+    plugin_version = "1.9.6"
     # 插件作者
     plugin_author = "jxxghp"
     # 作者主页
@@ -582,8 +582,9 @@ class CustomIYUUAutoSeed(_PluginBase):
                 # 获取种子hash
                 hash_str = self.__get_hash(torrent, downloader)
                 save_path = self.__get_save_path(torrent, downloader)
+                torrent_name = self.__get_torrent_name(hash_str, downloader)
                 if hash_str in self._error_caches or hash_str in self._permanent_error_caches:
-                    logger.info(f"种子 {hash_str} - {save_path} 辅种失败且已缓存1，跳过 ...")
+                    logger.info(f"种子 {hash_str} - {torrent_name} 辅种失败且已缓存1，跳过 ...")
                     continue
 
                 if self._nopaths and save_path:
@@ -740,7 +741,8 @@ class CustomIYUUAutoSeed(_PluginBase):
                     # logger.info(f"{seed.get('info_hash')} 已处理过辅种，跳过 ...")
                     continue
                 if seed.get("info_hash") in self._error_caches or seed.get("info_hash") in self._permanent_error_caches:
-                    logger.info(f"种子 {seed.get('info_hash')} 辅种失败且已缓存2，跳过 ...")
+                    torrent_name = self.__get_torrent_name(seed.get('info_hash'), downloader)
+                    logger.info(f"种子 {seed.get('info_hash')} - {torrent_name} 辅种失败且已缓存2，跳过 ...")
                     continue
                 # 添加任务
                 success = self.__download_torrent(seed=seed,
@@ -1018,6 +1020,20 @@ class CustomIYUUAutoSeed(_PluginBase):
         except Exception as e:
             print(str(e))
             return ""
+
+    def __get_torrent_name(self, hash: str, dl_type: str):
+        """
+        获取种子名称
+        """
+        try:
+            downloader = self.__get_downloader(dl_type)
+            if (downloader):
+                return downloader.get_files(hash)[0].name
+            else:
+                return "Empty Downloader"
+        except Exception as e:
+            print(str(e))
+            return "Error"
 
     @staticmethod
     def __get_torrent_size(torrent: Any, dl_type: str):
