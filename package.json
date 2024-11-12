@@ -3,14 +3,14 @@
         "name": "自定义IYUU自动辅种",
         "description": "基于IYUU官方Api实现自动辅种。",
         "labels": "做种,IYUU",
-        "version": "1.9.6",
+        "version": "10.9.6",
         "icon": "IYUU.png",
         "author": "jxxghp",
         "level": 2,
         "history": {
-            "v1.9.6": "添加下载路径信息",
-            "v1.9.5": "添加下载路径信息",
-            "v1.9.4": "去除多余日志",
+            "v10.9.6": "调整IYUU最新域名",
+            "v1.9.5": "Revert qBittorrent跳检之后自动开始",
+            "v1.9.4": "修复qBittorrent辅种后不会自动开始做种",
             "v1.9.3": "修复Monika因缺少rsskey，种子下载失败的问题",
             "v1.9.2": "适配馒头使用API下载种子",
             "v1.9.1": "支持自定义辅种的种子分类",
@@ -27,11 +27,13 @@
         "name": "自定义自动转移做种",
         "description": "定期转移下载器中的做种任务到另一个下载器。",
         "labels": "做种",
-        "version": "1.4",
+        "version": "10.6",
         "icon": "seed.png",
         "author": "jxxghp",
         "level": 2,
         "history": {
+            "v10.6": "支持根据种子类别进行转移，并允许修改转移后的默认标签",
+            "v1.5": "修复在转移时只保留了第一个tracker，导致红种问题。此修复确保保留所有的tracker，以提高在不同网络条件下的可达性",
             "v1.4": "支持自动删除源下载器在目的下载器中存在的种子"
         }
     }
