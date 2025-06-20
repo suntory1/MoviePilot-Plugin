@@ -2,7 +2,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from threading import Event
-from typing import Any, List, Dict, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,34 +13,33 @@ from ruamel.yaml import CommentedMap
 from app.core.config import settings
 from app.core.event import eventmanager
 from app.db.site_oper import SiteOper
+from app.helper.downloader import DownloaderHelper
 from app.helper.sites import SitesHelper
 from app.helper.torrent import TorrentHelper
 from app.log import logger
-from app.modules.qbittorrent import Qbittorrent
-from app.modules.transmission import Transmission
 from app.plugins import _PluginBase
-from app.plugins.customiyuuautoseed.iyuu_helper import IyuuHelper
-from app.schemas import NotificationType
+from app.plugins.iyuuautoseedc.iyuu_helper import IyuuHelper
+from app.schemas import NotificationType, ServiceInfo
 from app.schemas.types import EventType
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
 
-class CustomIYUUAutoSeed(_PluginBase):
+class IYUUAutoSeedC(_PluginBase):
     # 插件名称
-    plugin_name = "自定义IYUU自动辅种"
+    plugin_name = "IYUU自动辅种C"
     # 插件描述
     plugin_desc = "基于IYUU官方Api实现自动辅种。"
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "10.9.6"
+    plugin_version = "2.14.1"
     # 插件作者
-    plugin_author = "jxxghp"
+    plugin_author = "jxxghp,CKun,Suntory"
     # 作者主页
     author_url = "https://github.com/jxxghp"
     # 插件配置项ID前缀
-    plugin_config_prefix = "custom_iyuuautoseed_"
+    plugin_config_prefix = "iyuuautoseedc_"
     # 加载顺序
     plugin_order = 1
     # 可使用的用户级别
@@ -48,12 +47,7 @@ class CustomIYUUAutoSeed(_PluginBase):
 
     # 私有属性
     _scheduler = None
-    iyuuhelper = None
-    qb = None
-    tr = None
-    sites = None
-    siteoper = None
-    torrent = None
+    iyuu_helper = None
     # 开关
     _enabled = False
     _cron = None
@@ -61,6 +55,10 @@ class CustomIYUUAutoSeed(_PluginBase):
     _onlyonce = False
     _token = None
     _downloaders = []
+    # 辅种下载器
+    _auto_downloader = None
+    # 自动分类
+    _auto_category = False
     _sites = []
     _notify = False
     _nolabels = None
@@ -69,7 +67,9 @@ class CustomIYUUAutoSeed(_PluginBase):
     _categoryafterseed = None
     _addhosttotag = False
     _size = None
+    _recheck_interval = None
     _clearcache = False
+    _auto_start = False
     # 退出事件
     _event = Event()
     # 种子链接xpaths
@@ -97,9 +97,7 @@ class CustomIYUUAutoSeed(_PluginBase):
     cached = 0
 
     def init_plugin(self, config: dict = None):
-        self.sites = SitesHelper()
-        self.siteoper = SiteOper()
-        self.torrent = TorrentHelper()
+
         # 读取配置
         if config:
             self._enabled = config.get("enabled")
@@ -108,22 +106,26 @@ class CustomIYUUAutoSeed(_PluginBase):
             self._cron = config.get("cron")
             self._token = config.get("token")
             self._downloaders = config.get("downloaders")
+            self._auto_downloader = config.get("auto_downloader")
             self._sites = config.get("sites") or []
             self._notify = config.get("notify")
             self._nolabels = config.get("nolabels")
             self._nopaths = config.get("nopaths")
             self._labelsafterseed = config.get("labelsafterseed") if config.get("labelsafterseed") else "已整理,辅种"
             self._categoryafterseed = config.get("categoryafterseed")
+            self._auto_category = config.get("auto_category")
+            self._auto_start = config.get("auto_start")
             self._addhosttotag = config.get("addhosttotag")
             self._size = float(config.get("size")) if config.get("size") else 0
+            self._recheck_interval = int(config.get("recheck_interval")) if config.get("recheck_interval") else 60
             self._clearcache = config.get("clearcache")
             self._permanent_error_caches = [] if self._clearcache else config.get("permanent_error_caches") or []
             self._error_caches = [] if self._clearcache else config.get("error_caches") or []
             self._success_caches = [] if self._clearcache else config.get("success_caches") or []
 
             # 过滤掉已删除的站点
-            all_sites = [site.id for site in self.siteoper.list_order_by_pri()] + [site.get("id") for site in
-                                                                                   self.__custom_sites()]
+            all_sites = [site.id for site in SiteOper().list_order_by_pri()] + [site.get("id") for site in
+                                                                                self.__custom_sites()]
             self._sites = [site_id for site_id in all_sites if site_id in self._sites]
             self.__update_config()
 
@@ -132,10 +134,8 @@ class CustomIYUUAutoSeed(_PluginBase):
 
         # 启动定时任务 & 立即运行一次
         if self.get_state() or self._onlyonce:
-            self.iyuuhelper = IyuuHelper(token=self._token)
+            self.iyuu_helper = IyuuHelper(token=self._token)
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            self.qb = Qbittorrent()
-            self.tr = Transmission()
 
             if self._onlyonce:
                 logger.info(f"辅种服务启动，立即运行一次")
@@ -143,23 +143,66 @@ class CustomIYUUAutoSeed(_PluginBase):
                                         run_date=datetime.now(
                                             tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3)
                                         )
-
                 # 关闭一次性开关
                 self._onlyonce = False
-                if self._scheduler.get_jobs():
-                    # 追加种子校验服务
-                    # self._scheduler.add_job(self.check_recheck, 'interval', minutes=3)
-                    # 启动服务
-                    self._scheduler.print_jobs()
-                    self._scheduler.start()
 
             if self._clearcache:
                 # 关闭清除缓存开关
                 self._clearcache = False
+            # 保存配置
+            self.__update_config()
 
-            if self._clearcache or self._onlyonce:
-                # 保存配置
-                self.__update_config()
+            # 追加种子校验服务
+            self._scheduler.add_job(self.check_recheck, 'interval', minutes=self._recheck_interval)
+            # 启动服务
+            self._scheduler.print_jobs()
+            self._scheduler.start()
+
+    @property
+    def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
+        """
+        服务信息
+        """
+        if not self._downloaders:
+            logger.warning("尚未配置下载器，请检查配置")
+            return None
+
+        services = DownloaderHelper().get_services(name_filters=self._downloaders)
+        if not services:
+            logger.warning("获取下载器实例失败，请检查配置")
+            return None
+
+        active_services = {}
+        for service_name, service_info in services.items():
+            if service_info.instance.is_inactive():
+                logger.warning(f"下载器 {service_name} 未连接，请检查配置")
+            else:
+                active_services[service_name] = service_info
+
+        if not active_services:
+            logger.warning("没有已连接的下载器，请检查配置")
+            return None
+
+        return active_services
+
+    @property
+    def auto_service_info(self) -> ServiceInfo | None:
+        """
+        服务信息
+        """
+        if not self._auto_downloader:
+            logger.debug("尚未配置主辅分离下载器，辅种不分离")
+            return None
+
+        service = DownloaderHelper().get_service(name=self._auto_downloader)
+        if not service:
+            logger.warning("获取主辅分离下载器实例失败，请检查配置")
+            return None
+
+        if service.instance.is_inactive():
+            logger.warning(f"下载器 {service.name} 未连接，请检查配置")
+            return None
+        return service
 
     def get_state(self) -> bool:
         return True if self._enabled and self._cron and self._token and self._downloaders else False
@@ -184,8 +227,8 @@ class CustomIYUUAutoSeed(_PluginBase):
         """
         if self.get_state():
             return [{
-                "id": "CustomIYUUAutoSeed",
-                "name": "IYUU自动辅种服务",
+                "id": "IYUUAutoSeedC",
+                "name": "IYUU自动辅种服务C",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.auto_seed,
                 "kwargs": {}
@@ -201,7 +244,7 @@ class CustomIYUUAutoSeed(_PluginBase):
 
         # 站点的可选项
         site_options = ([{"title": site.name, "value": site.id}
-                         for site in self.siteoper.list_order_by_pri()]
+                         for site in SiteOper().list_order_by_pri()]
                         + [{"title": site.get("name"), "value": site.get("id")}
                            for site in customSites])
         return [
@@ -215,7 +258,7 @@ class CustomIYUUAutoSeed(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -231,7 +274,7 @@ class CustomIYUUAutoSeed(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -247,7 +290,23 @@ class CustomIYUUAutoSeed(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'clearcache',
+                                            'label': '清除缓存后运行',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -288,7 +347,7 @@ class CustomIYUUAutoSeed(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VCronField',
                                         'props': {
                                             'model': 'cron',
                                             'label': '执行周期',
@@ -306,7 +365,7 @@ class CustomIYUUAutoSeed(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 6
+                                    'md': 4
                                 },
                                 'content': [
                                     {
@@ -314,12 +373,11 @@ class CustomIYUUAutoSeed(_PluginBase):
                                         'props': {
                                             'chips': True,
                                             'multiple': True,
+                                            'clearable': True,
                                             'model': 'downloaders',
-                                            'label': '辅种下载器',
-                                            'items': [
-                                                {'title': 'Qbittorrent', 'value': 'qbittorrent'},
-                                                {'title': 'Transmission', 'value': 'transmission'}
-                                            ]
+                                            'label': '下载器',
+                                            'items': [{"title": config.name, "value": config.name}
+                                                      for config in DownloaderHelper().get_configs().values()]
                                         }
                                     }
                                 ]
@@ -328,7 +386,27 @@ class CustomIYUUAutoSeed(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 6
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'chips': True,
+                                            'clearable': True,
+                                            'model': 'auto_downloader',
+                                            'label': '主辅分离',
+                                            'items': [{"title": config.name, "value": config.name}
+                                                      for config in DownloaderHelper().get_configs().values()]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
                                 },
                                 'content': [
                                     {
@@ -337,6 +415,23 @@ class CustomIYUUAutoSeed(_PluginBase):
                                             'model': 'size',
                                             'label': '辅种体积大于(GB)',
                                             'placeholder': '只有大于该值的才辅种'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'recheck_interval',
+                                            'label': '辅种校验任务间隔',
+                                            'placeholder': '辅种校验任务间隔'
                                         }
                                     }
                                 ]
@@ -446,7 +541,7 @@ class CustomIYUUAutoSeed(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -462,7 +557,7 @@ class CustomIYUUAutoSeed(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -478,15 +573,75 @@ class CustomIYUUAutoSeed(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
                                         'component': 'VSwitch',
                                         'props': {
-                                            'model': 'clearcache',
-                                            'label': '清除缓存后运行',
+                                            'model': 'auto_start',
+                                            'label': '自动开始(跳过校验有效)',
                                         }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'auto_category',
+                                            'label': '分类复用(仅QB有效)',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'props': {
+                            'style': {
+                                'margin-top': '12px'
+                            },
+                        },
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'error',
+                                            'variant': 'tonal'
+                                        },
+                                        'content': [
+                                            {
+                                                'component': 'span',
+                                                'text': '注意：详细配置说明和注意事项请参考：'
+                                            },
+                                            {
+                                                'component': 'a',
+                                                'props': {
+                                                    'href': 'https://github.com/jxxghp/MoviePilot-Plugins/tree/main/plugins.v2/iyuuautoseed/README.md',
+                                                    'target': '_blank'
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'u',
+                                                        'text': 'README'
+                                                    }
+                                                ]
+                                            }
+                                        ]
                                     }
                                 ]
                             }
@@ -501,9 +656,12 @@ class CustomIYUUAutoSeed(_PluginBase):
             "notify": False,
             "clearcache": False,
             "addhosttotag": False,
+            "auto_category": False,
+            "auto_start": False,
             "cron": "",
             "token": "",
             "downloaders": [],
+            "auto_downloader": "",
             "sites": [],
             "nopaths": "",
             "nolabels": "",
@@ -524,6 +682,7 @@ class CustomIYUUAutoSeed(_PluginBase):
             "cron": self._cron,
             "token": self._token,
             "downloaders": self._downloaders,
+            "auto_downloader": self._auto_downloader,
             "sites": self._sites,
             "notify": self._notify,
             "nolabels": self._nolabels,
@@ -531,28 +690,19 @@ class CustomIYUUAutoSeed(_PluginBase):
             "labelsafterseed": self._labelsafterseed,
             "categoryafterseed": self._categoryafterseed,
             "addhosttotag": self._addhosttotag,
+            "auto_category": self._auto_category,
+            "auto_start": self._auto_start,
             "size": self._size,
             "success_caches": self._success_caches,
             "error_caches": self._error_caches,
             "permanent_error_caches": self._permanent_error_caches
         })
 
-    def __get_downloader(self, dtype: str):
-        """
-        根据类型返回下载器实例
-        """
-        if dtype == "qbittorrent":
-            return self.qb
-        elif dtype == "transmission":
-            return self.tr
-        else:
-            return None
-
     def auto_seed(self):
         """
         开始辅种
         """
-        if not self.iyuuhelper:
+        if not self.iyuu_helper or not self.service_infos:
             return
         logger.info("开始辅种任务 ...")
 
@@ -564,9 +714,10 @@ class CustomIYUUAutoSeed(_PluginBase):
         self.fail = 0
         self.cached = 0
         # 扫描下载器辅种
-        for downloader in self._downloaders:
+        for service in self.service_infos.values():
+            downloader = service.name
+            downloader_obj = service.instance
             logger.info(f"开始扫描下载器 {downloader} ...")
-            downloader_obj = self.__get_downloader(downloader)
             # 获取下载器中已完成的种子
             torrents = downloader_obj.get_completed_torrents()
             if torrents:
@@ -580,11 +731,11 @@ class CustomIYUUAutoSeed(_PluginBase):
                     logger.info(f"辅种服务停止")
                     return
                 # 获取种子hash
-                hash_str = self.__get_hash(torrent, downloader)
+                hash_str = self.__get_hash(torrent=torrent, dl_type=service.type)
                 if hash_str in self._error_caches or hash_str in self._permanent_error_caches:
                     logger.info(f"种子 {hash_str} 辅种失败且已缓存，跳过 ...")
                     continue
-                save_path = self.__get_save_path(torrent, downloader)
+                save_path = self.__get_save_path(torrent=torrent, dl_type=service.type)
 
                 if self._nopaths and save_path:
                     # 过滤不需要转移的路径
@@ -598,7 +749,7 @@ class CustomIYUUAutoSeed(_PluginBase):
                         continue
 
                 # 获取种子标签
-                torrent_labels = self.__get_label(torrent, downloader)
+                torrent_labels = self.__get_label(torrent=torrent, dl_type=service.type)
                 if torrent_labels and self._nolabels:
                     is_skip = False
                     for label in self._nolabels.split(','):
@@ -608,16 +759,16 @@ class CustomIYUUAutoSeed(_PluginBase):
                             break
                     if is_skip:
                         continue
-
                 # 体积排除辅种
-                torrent_size = self.__get_torrent_size(torrent, downloader) / 1024 / 1024 / 1024
+                torrent_size = self.__get_torrent_size(torrent=torrent, dl_type=service.type) / 1024 / 1024 / 1024
                 if self._size and torrent_size < self._size:
                     logger.info(f"种子 {hash_str} 大小:{torrent_size:.2f}GB，小于设定 {self._size}GB，跳过 ...")
                     continue
-
+                category = self.__get_category(torrent=torrent, dl_type=service.type) if self._auto_category else None
                 hash_strs.append({
                     "hash": hash_str,
-                    "save_path": save_path
+                    "save_path": save_path,
+                    "category": category or self._categoryafterseed
                 })
             if hash_strs:
                 logger.info(f"总共需要辅种的种子数：{len(hash_strs)}")
@@ -628,11 +779,12 @@ class CustomIYUUAutoSeed(_PluginBase):
                     chunk = hash_strs[i:i + chunk_size]
                     # 处理分组
                     self.__seed_torrents(hash_strs=chunk,
-                                         downloader=downloader)
+                                         service=service)
                 # 触发校验检查
                 self.check_recheck()
             else:
                 logger.info(f"没有需要辅种的种子")
+
         # 保存缓存
         self.__update_config()
         # 发送消息
@@ -659,53 +811,69 @@ class CustomIYUUAutoSeed(_PluginBase):
         if self._is_recheck_running:
             return
         self._is_recheck_running = True
-        for downloader in self._downloaders:
+        if self.auto_service_info:
+            # 检查指定下载器
+            self.check_recheck_service(self.auto_service_info)
+            self._is_recheck_running = False
+            return
+        if not self.service_infos:
+            return
+        for service in self.service_infos.values():
             # 需要检查的种子
-            recheck_torrents = self._recheck_torrents.get(downloader) or []
-            if not recheck_torrents:
-                continue
-            logger.info(f"开始检查下载器 {downloader} 的校验任务 ...")
-            # 下载器
-            downloader_obj = self.__get_downloader(downloader)
-            # 获取下载器中的种子状态
-            torrents, _ = downloader_obj.get_torrents(ids=recheck_torrents)
-            if torrents:
-                can_seeding_torrents = []
-                for torrent in torrents:
-                    # 获取种子hash
-                    hash_str = self.__get_hash(torrent, downloader)
-                    if self.__can_seeding(torrent, downloader):
-                        can_seeding_torrents.append(hash_str)
-                if can_seeding_torrents:
-                    logger.info(f"共 {len(can_seeding_torrents)} 个任务校验完成，开始辅种 ...")
-                    # 开始任务
-                    downloader_obj.start_torrents(ids=can_seeding_torrents)
-                    # 去除已经处理过的种子
-                    self._recheck_torrents[downloader] = list(
-                        set(recheck_torrents).difference(set(can_seeding_torrents)))
-            elif torrents is None:
-                logger.info(f"下载器 {downloader} 查询校验任务失败，将在下次继续查询 ...")
-                continue
-            else:
-                logger.info(f"下载器 {downloader} 中没有需要检查的校验任务，清空待处理列表 ...")
-                self._recheck_torrents[downloader] = []
+            self.check_recheck_service(service)
         self._is_recheck_running = False
 
-    def __seed_torrents(self, hash_strs: list, downloader: str):
+    def check_recheck_service(self, service: ServiceInfo):
+        """
+        检查指定下载器中种子是否校验完成，校验完成且完整的自动开始辅种
+        """
+        # 需要检查的种子
+        downloader = service.name
+        downloader_obj = service.instance
+        recheck_torrents = self._recheck_torrents.get(downloader) or []
+        if not recheck_torrents:
+            return
+        logger.info(f"开始检查下载器 {downloader} 的校验任务 ...")
+        # 获取下载器中的种子状态
+        torrents, _ = downloader_obj.get_torrents(ids=recheck_torrents)
+        if torrents:
+            can_seeding_torrents = []
+            for torrent in torrents:
+                # 获取种子hash
+                hash_str = self.__get_hash(torrent=torrent, dl_type=service.type)
+                if self.__can_seeding(torrent=torrent, dl_type=service.type):
+                    can_seeding_torrents.append(hash_str)
+            if can_seeding_torrents:
+                logger.info(f"共 {len(can_seeding_torrents)} 个任务校验完成，开始辅种 ...")
+                # 开始任务
+                downloader_obj.start_torrents(ids=can_seeding_torrents)
+                # 去除已经处理过的种子
+                self._recheck_torrents[downloader] = list(
+                    set(recheck_torrents).difference(set(can_seeding_torrents)))
+        elif torrents is None:
+            logger.info(f"下载器 {downloader} 查询校验任务失败，将在下次继续查询 ...")
+            return
+        else:
+            logger.info(f"下载器 {downloader} 中没有需要检查的校验任务，清空待处理列表 ...")
+            self._recheck_torrents[downloader] = []
+
+    def __seed_torrents(self, hash_strs: list, service: ServiceInfo):
         """
         执行一批种子的辅种
         """
         if not hash_strs:
             return
-        logger.info(f"下载器 {downloader} 开始查询辅种，数量：{len(hash_strs)} ...")
+        logger.info(f"下载器 {service.name} 开始查询辅种，数量：{len(hash_strs)} ...")
         # 下载器中的Hashs
         hashs = [item.get("hash") for item in hash_strs]
         # 每个Hash的保存目录
         save_paths = {}
+        save_category = {}
         for item in hash_strs:
             save_paths[item.get("hash")] = item.get("save_path")
+            save_category[item.get("hash")] = item.get("category")
         # 查询可辅种数据
-        seed_list, msg = self.iyuuhelper.get_seed_info(hashs)
+        seed_list, msg = self.iyuu_helper.get_seed_info(hashs)
         if not isinstance(seed_list, dict):
             # 判断辅种异常是否是由于Token未认证导致的，由于没有解决接口，只能从返回值来判断
             if self._token and msg == '请求缺少token':
@@ -742,20 +910,27 @@ class CustomIYUUAutoSeed(_PluginBase):
                 if seed.get("info_hash") in self._error_caches or seed.get("info_hash") in self._permanent_error_caches:
                     logger.info(f"种子 {seed.get('info_hash')} 辅种失败且已缓存，跳过 ...")
                     continue
-                # 添加任务
-                success = self.__download_torrent(seed=seed,
-                                                  downloader=downloader,
-                                                  save_path=save_paths.get(current_hash))
+                # 添加任务 如果配置了主辅分离使用辅种下载器
+                if self._auto_downloader:
+                    success = self.__download_torrent(seed=seed,
+                                                      service=self.auto_service_info,
+                                                      save_path=save_paths.get(current_hash),
+                                                      save_category=save_category.get(current_hash))
+                else:
+                    success = self.__download_torrent(seed=seed,
+                                                      service=service,
+                                                      save_path=save_paths.get(current_hash),
+                                                      save_category=save_category.get(current_hash))
                 if success:
                     success_torrents.append(seed.get("info_hash"))
 
             # 辅种成功的去重放入历史
             if len(success_torrents) > 0:
                 self.__save_history(current_hash=current_hash,
-                                    downloader=downloader,
+                                    downloader=service.name,
                                     success_torrents=success_torrents)
 
-        logger.info(f"下载器 {downloader} 辅种完成")
+        logger.info(f"下载器 {service.name} 辅种完成")
 
     def __save_history(self, current_hash: str, downloader: str, success_torrents: []):
         """
@@ -809,8 +984,8 @@ class CustomIYUUAutoSeed(_PluginBase):
         except Exception as e:
             print(str(e))
 
-    def __download(self, downloader: str, content: bytes,
-                   save_path: str, site_name: str) -> Optional[str]:
+    def __download(self, service: ServiceInfo, content: bytes,
+                   save_path: str, save_category: str, site_name: str) -> Optional[str]:
 
         torrent_tags = self._labelsafterseed.split(',')
 
@@ -821,42 +996,42 @@ class CustomIYUUAutoSeed(_PluginBase):
         """
         添加下载任务
         """
-        if downloader == "qbittorrent":
+        if service.type == "qbittorrent":
             # 生成随机Tag
             tag = StringUtils.generate_random_str(10)
 
             torrent_tags.append(tag)
 
-            state = self.qb.add_torrent(content=content,
-                                        download_dir=save_path,
-                                        is_paused=True,
-                                        tag=torrent_tags,
-                                        category=self._categoryafterseed,
-                                        is_skip_checking=self._skipverify)
+            state = service.instance.add_torrent(content=content,
+                                                 download_dir=save_path,
+                                                 is_paused=True,
+                                                 tag=torrent_tags,
+                                                 category=save_category,
+                                                 is_skip_checking=self._skipverify)
             if not state:
                 return None
             else:
                 # 获取种子Hash
-                torrent_hash = self.qb.get_torrent_id_by_tag(tags=tag)
+                torrent_hash = service.instance.get_torrent_id_by_tag(tags=tag)
                 if not torrent_hash:
-                    logger.error(f"{downloader} 下载任务添加成功，但获取任务信息失败！")
+                    logger.error(f"{service.name} 下载任务添加成功，但获取任务信息失败！")
                     return None
             return torrent_hash
-        elif downloader == "transmission":
+        elif service.type == "transmission":
             # 添加任务
-            torrent = self.tr.add_torrent(content=content,
-                                          download_dir=save_path,
-                                          is_paused=True,
-                                          labels=torrent_tags)
+            torrent = service.instance.add_torrent(content=content,
+                                                   download_dir=save_path,
+                                                   is_paused=True,
+                                                   labels=torrent_tags)
             if not torrent:
                 return None
             else:
                 return torrent.hashString
 
-        logger.error(f"不支持的下载器：{downloader}")
+        logger.error(f"不支持的下载器：{service.type}")
         return None
 
-    def __download_torrent(self, seed: dict, downloader: str, save_path: str):
+    def __download_torrent(self, seed: dict, service: ServiceInfo, save_path: str, save_category: str):
         """
         下载种子
         torrent: {
@@ -876,7 +1051,7 @@ class CustomIYUUAutoSeed(_PluginBase):
 
         self.total += 1
         # 获取种子站点及下载地址模板
-        site_url, download_page = self.iyuuhelper.get_torrent_url(seed.get("sid"))
+        site_url, download_page = self.iyuu_helper.get_torrent_url(seed.get("sid"))
         if not site_url or not download_page:
             # 加入缓存
             self._error_caches.append(seed.get("info_hash"))
@@ -886,7 +1061,8 @@ class CustomIYUUAutoSeed(_PluginBase):
         # 查询站点
         site_domain = StringUtils.get_url_domain(site_url)
         # 站点信息
-        site_info = self.sites.get_indexer(site_domain)
+        sites_helper = SitesHelper()
+        site_info = sites_helper.get_indexer(site_domain)
         if not site_info or not site_info.get('url'):
             logger.debug(f"没有维护种子对应的站点：{site_url}")
             return False
@@ -895,14 +1071,14 @@ class CustomIYUUAutoSeed(_PluginBase):
             return False
         self.realtotal += 1
         # 查询hash值是否已经在下载器中
-        downloader_obj = self.__get_downloader(downloader)
+        downloader_obj = service.instance
         torrent_info, _ = downloader_obj.get_torrents(ids=[seed.get("info_hash")])
         if torrent_info:
             # logger.info(f"{seed.get('info_hash')} 已在下载器中，跳过 ...")
             self.exist += 1
             return False
         # 站点流控
-        check, checkmsg = self.sites.check(site_domain)
+        check, checkmsg = sites_helper.check(site_domain)
         if check:
             logger.warn(checkmsg)
             self.fail += 1
@@ -924,7 +1100,7 @@ class CustomIYUUAutoSeed(_PluginBase):
             else:
                 torrent_url += "?https=1"
         # 下载种子文件
-        _, content, _, _, error_msg = self.torrent.download_torrent(
+        _, content, _, _, error_msg = TorrentHelper().download_torrent(
             url=torrent_url,
             cookie=site_info.get("cookie"),
             ua=site_info.get("ua") or settings.USER_AGENT,
@@ -942,9 +1118,10 @@ class CustomIYUUAutoSeed(_PluginBase):
             return False
         # 添加下载，辅种任务默认暂停
         logger.info(f"添加下载任务：{torrent_url} ...")
-        download_id = self.__download(downloader=downloader,
+        download_id = self.__download(service=service,
                                       content=content,
                                       save_path=save_path,
+                                      save_category=save_category,
                                       site_name=site_info.get("name"))
         if not download_id:
             # 下载失败
@@ -954,28 +1131,32 @@ class CustomIYUUAutoSeed(_PluginBase):
             return False
         else:
             self.success += 1
-            if self._skipverify:
-                # 跳过校验
-                logger.info(f"{download_id} 跳过校验，请自行检查...")
-                # 请注意这里是故意不自动开始的
-                # 跳过校验存在直接失败、种子目录相同文件不同等异常情况
-                # 必须要用户自行二次确认之后才能开始做种
-                # 否则会出现反复下载刷掉分享率、做假种的情况
-            else:
-                # 追加校验任务
-                logger.info(f"添加校验检查任务：{download_id} ...")
-                if not self._recheck_torrents.get(downloader):
-                    self._recheck_torrents[downloader] = []
-                self._recheck_torrents[downloader].append(download_id)
-                # TR会自动校验
-                if downloader == "qbittorrent":
+            if service.type == "qbittorrent":
+                if self._skipverify:
+                    if self._auto_start:
+                        logger.info(f"{download_id} 跳过校验，开启自动开始，注意观察种子的完整性")
+                        self.__add_recheck_torrents(service, download_id)
+                    else:
+                        # 跳过校验
+                        logger.info(f"{download_id} 跳过校验，请自行检查手动开始任务...")
+                else:
                     # 开始校验种子
                     downloader_obj.recheck_torrents(ids=[download_id])
+                    self.__add_recheck_torrents(service, download_id)
+            else:
+                self.__add_recheck_torrents(service, download_id)
             # 下载成功
             logger.info(f"成功添加辅种下载，站点：{site_info.get('name')}，种子链接：{torrent_url}")
             # 成功也加入缓存，有一些改了路径校验不通过的，手动删除后，下一次又会辅上
             self._success_caches.append(seed.get("info_hash"))
             return True
+
+    def __add_recheck_torrents(self, service: ServiceInfo, download_id: str):
+        # 追加校验任务
+        logger.info(f"添加校验检查任务：{download_id} ...")
+        if not self._recheck_torrents.get(service.name):
+            self._recheck_torrents[service.name] = []
+        self._recheck_torrents[service.name].append(download_id)
 
     @staticmethod
     def __get_hash(torrent: Any, dl_type: str):
@@ -1001,12 +1182,23 @@ class CustomIYUUAutoSeed(_PluginBase):
             return []
 
     @staticmethod
+    def __get_category(torrent: Any, dl_type: str):
+        """
+        获取种子分类
+        """
+        try:
+            return torrent.get("category") if dl_type == "qbittorrent" else None
+        except Exception as e:
+            print(str(e))
+            return []
+
+    @staticmethod
     def __can_seeding(torrent: Any, dl_type: str):
         """
         判断种子是否可以做种并处于暂停状态
         """
         try:
-            return torrent.get("state") == "pausedUP" if dl_type == "qbittorrent" \
+            return torrent.get("state") in ["pausedUP", "stoppedUP"] if dl_type == "qbittorrent" \
                 else (torrent.status.stopped and torrent.percent_done == 1)
         except Exception as e:
             print(str(e))
@@ -1044,7 +1236,7 @@ class CustomIYUUAutoSeed(_PluginBase):
             判断是否为mteam站点
             """
             return True if "m-team." in url else False
-        
+
         def __is_monika(url: str):
             """
             判断是否为monika站点
@@ -1063,11 +1255,11 @@ class CustomIYUUAutoSeed(_PluginBase):
             将mteam种子下载链接域名替换为使用API
             """
             api_url = re.sub(r'//[^/]+\.m-team', '//api.m-team', site.get('url'))
-            
+            ua = site.get("ua") or settings.USER_AGENT
             res = RequestUtils(
                 headers={
-                    'Content-Type': 'application/json',
-                    'User-Agent': f'{site.get("ua")}',
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': f'{ua}',
                     'Accept': 'application/json, text/plain, */*',
                     'x-api-key': apikey
                 }
@@ -1078,7 +1270,7 @@ class CustomIYUUAutoSeed(_PluginBase):
                 logger.warn(f"m-team 获取种子下载链接失败：{tid}")
                 return None
             return res.json().get("data")
-        
+
         def __get_monika_torrent(tid: str, rssurl: str):
             """
             Monika下载需要使用rsskey从站点配置中获取并拼接下载链接
@@ -1086,11 +1278,10 @@ class CustomIYUUAutoSeed(_PluginBase):
             if not rssurl:
                 logger.error("Monika站点的rss链接未配置")
                 return None
-           
+
             rss_match = re.search(r'/rss/\d+\.(\w+)', rssurl)
             rsskey = rss_match.group(1)
-            download_url = f"{site.get('url')}torrents/download/{tid}.{rsskey}"
-            return download_url
+            return f"{site.get('url')}torrents/download/{tid}.{rsskey}"
 
         def __is_special_site(url: str):
             """
@@ -1162,7 +1353,7 @@ class CustomIYUUAutoSeed(_PluginBase):
             logger.info(f"正在获取种子下载链接：{page_url} ...")
             res = RequestUtils(
                 cookies=site.get("cookie"),
-                ua=site.get("ua"),
+                ua=site.get("ua") or settings.USER_AGENT,
                 proxies=settings.PROXY if site.get("proxy") else None
             ).get_res(url=page_url)
             if res is not None and res.status_code in (200, 500):
