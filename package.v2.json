@@ -5,7 +5,7 @@
     "labels": "做种,IYUU",
     "version": "2.14.1",
     "icon": "IYUU.png",
-    "author": "jxxghp,CKun",
+    "author": "suntory,jxxghp,CKun",
     "level": 2,
     "history": {
       "v2.14.1": "修改辅种校验任务检查间隔",
