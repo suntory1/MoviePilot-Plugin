@@ -37,7 +37,7 @@ class IYUUAutoSeedC(_PluginBase):
     # 插件作者
     plugin_author = "jxxghp,CKun,Suntory"
     # 作者主页
-    author_url = "https://github.com/jxxghp"
+    author_url = "https://github.com/suntory1/MoviePilot-Plugin"
     # 插件配置项ID前缀
     plugin_config_prefix = "iyuuautoseedc_"
     # 加载顺序
